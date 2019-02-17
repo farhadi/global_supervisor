@@ -1,7 +1,36 @@
 defmodule GlobalSupervisor do
   @moduledoc """
-  A supervisor that dynamically distributes children across all GlobalSupervisors
-  registered with the same name in the cluster.
+  A supervisor that dynamically distributes children across the cluster.
+
+  A `GlobalSupervisor` is like a `DynamicSupervisor` that coordinates with other
+  GlobalSupervisors registered with the same name in the cluster to dynamically
+  distribute children across the cluster.
+
+  A `GlobalSupervisor` has the same API and behaviour of a `DynamicSupervisor`
+  with some minor differences to provide distributed functionality.
+  When you start a child using `start_child/2`, global supervisor uses a
+  consistent hash algorithm to decide on which node it should be started.
+  When a node goes down, all children running on that node will be
+  redistributed on remaining nodes. When a new node is added to the cluster
+  global supervisor by default automatically rebalances distribution of
+  running children.
+
+  In case of a network split each partition restarts children running on the
+  other part assuming that part is down. Once the partition is healed,
+  children will be rebalanced again, but rebalancing might lead to some children
+  being started again on the same node which they started on initially.
+  Also when auto balancing is disabled, a healed netsplit might have multiple
+  instances of the same child running on two or more nodes. To prevent two
+  instances of the same child stay running after a net split heals, you need
+  to register each child process with a unique name. Local names will only
+  prevent running multiple instances of a child on a single node, you can
+  use `:global` registry or any other distributed registry to prevent running
+  multiple instances of a child across the cluster.
+
+  `temporary` children once started, won't be rebalanced or moved in the cluster.
+
+  You can change consistent hash algorithm, and disable auto balancing feature
+  using init options.
   """
   @behaviour GenServer
 
@@ -24,6 +53,12 @@ defmodule GlobalSupervisor do
           locator: (tuple(), [atom()] -> atom())
         }
 
+  @typedoc "Option values used by the `start*` functions"
+  @type option :: {:name, Supervisor.name()} | init_option()
+
+  @typedoc "Options used by the `start*` functions"
+  @type options :: [option, ...]
+
   @typedoc "Options given to `start_link/2` and `init/1`"
   @type init_option ::
           {:strategy, strategy()}
@@ -36,6 +71,15 @@ defmodule GlobalSupervisor do
 
   @typedoc "Supported strategies"
   @type strategy :: :one_for_one
+
+  @typedoc "Child specification"
+  @type child_spec :: {
+    {module(), atom(), [term()]},
+    :permanent | :transient | :temporary,
+    timeout() | :brutal_kill,
+    :worker | :supervisor,
+    [module()] | :dynamic
+  }
 
   # In this struct, `args` refers to the arguments passed to init/1 (the `init_arg`).
   defstruct [
@@ -93,6 +137,18 @@ defmodule GlobalSupervisor do
     end
   end
 
+  @doc """
+  Starts a supervisor with the given options.
+
+  The `:strategy` is a required option and the currently supported
+  value is `:one_for_one`. The remaining options can be found in the
+  `init/1` docs.
+
+  The `:name` option is used to group global supervisors with the same name
+  in the cluster together, and it has to be a local name, and if not provided
+  `GlobalSupervisor` will be used.
+  """
+  @spec start_link(options) :: Supervisor.on_start()
   def start_link(options) when is_list(options) do
     keys = [
       :extra_arguments,
@@ -108,17 +164,45 @@ defmodule GlobalSupervisor do
     start_link(Supervisor.Default, init(sup_opts), start_opts)
   end
 
+  @doc """
+  Starts a module-based supervisor process with the given `module` and `arg`.
+  """
+  @spec start_link(module, term, GenServer.options()) :: Supervisor.on_start()
   def start_link(mod, init_arg, opts \\ []) do
     opts = Keyword.put_new(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, {mod, init_arg, opts[:name]}, opts)
   end
 
+  @doc """
+  Dynamically starts a child under one of the global supervisor instances
+  registered with the same name in the cluster.
+
+  It uses `locate/2` as default `:locator` to decide where to start the child.
+  `:locator` can be changed in init options.
+  """
+  @spec start_child(Supervisor.supervisor(), Supervisor.child_spec() | {module, term} | module) ::
+          DynamicSupervisor.on_start_child()
   defdelegate start_child(supervisor, child_spec), to: DynamicSupervisor
 
+  @doc """
+  Scans all the local children and moves the ones that don't belong to the
+  current node based on the result of `:locater` function.
+
+  A global supervisor by default rebalances itself when cluster topology changes,
+  but if you disable `:auto_balance`, this function can be used to manually
+  rebalance children on each node.
+  """
+  @spec rebalance(Supervisor.supervisor()) :: :ok
   def rebalance(supervisor) do
     GenServer.cast(supervisor, :rebalance)
   end
 
+  @doc """
+  Default `:locator` used to locate where to start/move a child.
+
+  It uses `:erlang.phash2/2` to consistently select a node for the given child_spec.
+  """
+  @spec locate(child_spec(), [node()]) :: node()
   def locate(child_spec, nodes) do
     index = :erlang.phash2(child_spec, Enum.count(nodes))
     Enum.at(nodes, index)
@@ -131,6 +215,21 @@ defmodule GlobalSupervisor do
     |> Enum.sort()
   end
 
+  @doc """
+  Receives a set of `options` that initializes a global supervisor.
+
+  It accepts the same options as `DynamicSupervisor.init/1` with these two
+  additional options:
+
+    * `:locator` - a function that accepts child_spec as a tuple and a list
+    of nodes where childs can be placed on. This function should return one
+    of the nodes in the given nodes list, and is used by the supervisor to
+    decide where to start/move a child in the cluster. Defaults to `locate/2`.
+
+    * `:auto_balance` - whether to automatically rebalance children when a new
+    node is added to the cluster. Defaults to `true`.
+
+  """
   @spec init([init_option]) :: {:ok, sup_flags()}
   def init(options) when is_list(options) do
     {:ok, flags} = DynamicSupervisor.init(options)
