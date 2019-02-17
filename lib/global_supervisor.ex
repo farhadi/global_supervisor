@@ -74,12 +74,12 @@ defmodule GlobalSupervisor do
 
   @typedoc "Child specification"
   @type child_spec :: {
-    {module(), atom(), [term()]},
-    :permanent | :transient | :temporary,
-    timeout() | :brutal_kill,
-    :worker | :supervisor,
-    [module()] | :dynamic
-  }
+          {module(), atom(), [term()]},
+          :permanent | :transient | :temporary,
+          timeout() | :brutal_kill,
+          :worker | :supervisor,
+          [module()] | :dynamic
+        }
 
   # In this struct, `args` refers to the arguments passed to init/1 (the `init_arg`).
   defstruct [
@@ -183,6 +183,42 @@ defmodule GlobalSupervisor do
   @spec start_child(Supervisor.supervisor(), Supervisor.child_spec() | {module, term} | module) ::
           DynamicSupervisor.on_start_child()
   defdelegate start_child(supervisor, child_spec), to: DynamicSupervisor
+
+  @doc """
+  Terminates the given child identified by `pid`. It can be a child running on another node.
+
+  If successful, this function returns `:ok`. If there is no process with
+  the given PID, this function returns `{:error, :not_found}`.
+  """
+  @spec terminate_child(Supervisor.supervisor(), pid) :: :ok | {:error, :not_found}
+  defdelegate terminate_child(supervisor, pid), to: DynamicSupervisor
+
+  @doc """
+  Same as `DynamicSupervisor.which_children/1` with accumulated results of all global supervisors
+  registered with the same name in the cluster.
+  """
+  @spec which_children(Supervisor.supervisor()) :: [
+          {:undefined, pid | :restarting, :worker | :supervisor, :supervisor.modules()}
+        ]
+  defdelegate which_children(supervisor), to: DynamicSupervisor
+
+  @doc """
+  Same as `DynamicSupervisor.count_children/1` with accumulated results of all global supervisors
+  registered with the same name in the cluster.
+  """
+  @spec count_children(Supervisor.supervisor()) :: %{
+          specs: non_neg_integer,
+          active: non_neg_integer,
+          supervisors: non_neg_integer,
+          workers: non_neg_integer
+        }
+  defdelegate count_children(supervisor), to: DynamicSupervisor
+
+  @doc """
+  Same as `DynamicSupervisor.stop/3`.
+  """
+  @spec stop(Supervisor.supervisor(), reason :: term, timeout) :: :ok
+  defdelegate stop(supervisor, reason, timeout), to: DynamicSupervisor
 
   @doc """
   Scans all the local children and moves the ones that don't belong to the
@@ -337,13 +373,24 @@ defmodule GlobalSupervisor do
   defp validate_locator(locator), do: {:error, {:invalid_locator, locator}}
 
   @impl true
+  def handle_call(:which_children, from, state = %{nephews: nephews}) do
+    GenServer.cast(self(), {:which_children, Map.keys(nephews), [], from})
+    {:noreply, state}
+  end
+
+  def handle_call(:count_children, from, state = %{nephews: nephews}) do
+    acc = [specs: 0, active: 0, supervisors: 0, workers: 0]
+    GenServer.cast(self(), {:count_children, Map.keys(nephews), acc, from})
+    {:noreply, state}
+  end
+
   def handle_call({:start_child, child_spec}, from, state = %{name: name, locator: locator}) do
     node = locator.(child_spec, nodes(state))
 
     if node == node() do
       handle_call({:start_child_local, child_spec}, from, state)
     else
-      send({name, node}, {:"$gen_call", from,  {:start_child_local, child_spec}})
+      send({name, node}, {:"$gen_call", from, {:start_child_local, child_spec}})
       {:noreply, state}
     end
   end
@@ -353,14 +400,48 @@ defmodule GlobalSupervisor do
     DynamicSupervisor.handle_call({:start_child, child_spec}, from, state)
   end
 
-  def handle_call(request = {:terminate_child, _pid}, from, state) do
+  def handle_call({:terminate_child, pid}, from, state) when node(pid) == node() do
     GenServer.cast(self(), {:broadcast_children, state})
-    DynamicSupervisor.handle_call(request, from, state)
+    DynamicSupervisor.handle_call({:terminate_child, pid}, from, state)
+  end
+
+  def handle_call({:terminate_child, pid}, from, state = %{name: name}) do
+    send({name, node(pid)}, {:"$gen_call", from, {:terminate_child, pid}})
+    {:noreply, state}
   end
 
   defdelegate handle_call(request, from, state), to: DynamicSupervisor
 
   @impl true
+  def handle_cast({:which_children, nodes, acc, from}, state = %{name: name}) do
+    {:reply, children, state} = DynamicSupervisor.handle_call(:which_children, from, state)
+
+    case nodes do
+      [next | nodes] ->
+        GenServer.cast({name, next}, {:which_children, nodes, children ++ acc, from})
+
+      [] ->
+        GenServer.reply(from, children ++ acc)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:count_children, nodes, acc, from}, state = %{name: name}) do
+    {:reply, counts, state} = DynamicSupervisor.handle_call(:count_children, from, state)
+    acc = for {key, count} <- counts, do: {key, count + acc[key]}
+
+    case nodes do
+      [next | nodes] ->
+        GenServer.cast({name, next}, {:count_children, nodes, acc, from})
+
+      [] ->
+        GenServer.reply(from, acc)
+    end
+
+    {:noreply, state}
+  end
+
   def handle_cast({:children, node, children}, state) do
     {:noreply, update_nephews(node, children, state)}
   end
