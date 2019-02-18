@@ -218,7 +218,7 @@ defmodule GlobalSupervisor do
   Same as `DynamicSupervisor.stop/3`.
   """
   @spec stop(Supervisor.supervisor(), reason :: term, timeout) :: :ok
-  defdelegate stop(supervisor, reason, timeout), to: DynamicSupervisor
+  defdelegate stop(supervisor, reason \\ :normal, timeout \\ :infinity), to: DynamicSupervisor
 
   @doc """
   Scans all the local children and moves the ones that don't belong to the
