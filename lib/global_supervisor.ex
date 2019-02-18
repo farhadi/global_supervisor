@@ -198,7 +198,7 @@ defmodule GlobalSupervisor do
   registered with the same name in the cluster.
   """
   @spec which_children(Supervisor.supervisor()) :: [
-          {:undefined, pid | :restarting, :worker | :supervisor, :supervisor.modules()}
+          {:undefined, pid | :restarting, :worker | :supervisor, [module()]}
         ]
   defdelegate which_children(supervisor), to: DynamicSupervisor
 
@@ -442,6 +442,21 @@ defmodule GlobalSupervisor do
     {:noreply, state}
   end
 
+  def handle_cast({:start_children, children}, state) do
+    GenServer.cast(self(), {:broadcast_children, state})
+
+    state =
+      for child_spec <- children, reduce: state do
+        state ->
+          {:reply, _, state} =
+            DynamicSupervisor.handle_call({:start_child, child_spec}, {nil, nil}, state)
+
+          state
+      end
+
+    {:noreply, state}
+  end
+
   def handle_cast({:children, node, children}, state) do
     {:noreply, update_nephews(node, children, state)}
   end
@@ -459,18 +474,23 @@ defmodule GlobalSupervisor do
     GenServer.cast(self(), {:broadcast_children, state})
     nodes = nodes(state)
 
-    state =
+    {children, state} =
       for {pid, child_spec} <- children(state),
           node = locator.(child_spec, nodes),
           node != node(),
-          reduce: state do
-        state ->
+          reduce: {[], state} do
+        {children, state} ->
           {:reply, _, state} =
             DynamicSupervisor.handle_call({:terminate_child, pid}, {nil, nil}, state)
 
-          send({name, node}, {:"$gen_call", {nil, nil}, {:start_child_local, child_spec}})
-          state
+          {[{node, child_spec} | children], state}
       end
+
+    children
+    |> Enum.group_by(fn {node, _} -> node end, fn {_, child_spec} -> child_spec end)
+    |> Enum.each(fn {node, children} ->
+      GenServer.cast({name, node}, {:start_children, children})
+    end)
 
     {:noreply, state}
   end
@@ -505,10 +525,7 @@ defmodule GlobalSupervisor do
           node == node(),
           reduce: state do
         state ->
-          {:reply, _, state} =
-            DynamicSupervisor.handle_call({:start_child, child_spec}, {nil, nil}, state)
-
-          state
+          force_start_child(child_spec, state)
       end
 
     {:noreply, state}
@@ -541,6 +558,35 @@ defmodule GlobalSupervisor do
   end
 
   defdelegate handle_info(msg, state), to: DynamicSupervisor
+
+  defp force_start_child(child_spec, state),
+    do: force_start_child(child_spec, state, state.max_restarts)
+
+  defp force_start_child(_child_spec, state, 0), do: state
+
+  defp force_start_child(child_spec, state, retry) do
+    case DynamicSupervisor.handle_call({:start_child, child_spec}, {nil, nil}, state) do
+      {:reply, {:ok, _pid}, state} ->
+        state
+
+      {:reply, {:error, reason = {:already_started, pid}}, state} ->
+        if node() != node(pid) do
+          ref = Process.monitor(pid)
+
+          receive do
+            {:DOWN, ^ref, :process, ^pid, _} ->
+              force_start_child(child_spec, state, retry - 1)
+          after
+            100 ->
+              Process.demonitor(ref)
+              report_error(:start_error, reason, {:restarting, pid}, child_spec, state)
+              state
+          end
+        else
+          state
+        end
+    end
+  end
 
   defp start_child(m, f, a) do
     try do
