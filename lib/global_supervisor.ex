@@ -50,7 +50,7 @@ defmodule GlobalSupervisor do
           max_children: non_neg_integer() | :infinity,
           extra_arguments: [term()],
           auto_balance: boolean(),
-          locator: (tuple(), [atom()] -> atom())
+          locator: (child_spec(), [node()] -> node())
         }
 
   @typedoc "Option values used by the `start*` functions"
@@ -67,7 +67,7 @@ defmodule GlobalSupervisor do
           | {:max_children, non_neg_integer() | :infinity}
           | {:extra_arguments, [term()]}
           | {:auto_balance, boolean()}
-          | {:locator, (tuple(), [atom()] -> atom())}
+          | {:locator, (child_spec(), [node()] -> node())}
 
   @typedoc "Supported strategies"
   @type strategy :: :one_for_one
@@ -198,7 +198,7 @@ defmodule GlobalSupervisor do
   registered with the same name in the cluster.
   """
   @spec which_children(Supervisor.supervisor()) :: [
-          {:undefined, pid | :restarting, :worker | :supervisor, [module()]}
+          {:undefined, pid | :restarting, :worker | :supervisor, [module()] | :dynamic}
         ]
   defdelegate which_children(supervisor), to: DynamicSupervisor
 
@@ -268,10 +268,10 @@ defmodule GlobalSupervisor do
   """
   @spec init([init_option]) :: {:ok, sup_flags()}
   def init(options) when is_list(options) do
-    {:ok, flags} = DynamicSupervisor.init(options)
+    {auto_balance, options} = Keyword.pop(options, :auto_balance, true)
+    {locator, options} = Keyword.pop(options, :locator, &__MODULE__.locate/2)
 
-    auto_balance = Keyword.get(options, :auto_balance, true)
-    locator = Keyword.get(options, :locator, &__MODULE__.locate/2)
+    {:ok, flags} = DynamicSupervisor.init(options)
 
     flags =
       flags
